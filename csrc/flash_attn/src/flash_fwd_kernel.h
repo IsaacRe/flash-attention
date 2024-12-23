@@ -53,8 +53,8 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
 }
 
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
-inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, bool Aggregate_key_attn, typename Params>
+inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb /*batch*/, const int bidh /*head*/, const int m_block /*query block*/) {
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -131,6 +131,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
         return;
     }
+
+    int n_block = n_block_max - 1;
+    const int n_block_stride_A = params.a_row_stride * kBlockN;
+
     // if (tidx == 0) { printf("m_block = %d, n_block_min = %d, n_block_max = %d\n", m_block, n_block_min, n_block_max); }
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
@@ -158,6 +162,19 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                             make_stride(params.v_row_stride, params.v_head_stride, _1{}));
     Tensor gV = local_tile(mV(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
                            make_coord(_, 0));  // (kBlockN, kHeadDim, nblocksN)
+    // last mode in the above local_tile result is the number of blocks after the tiling is applied
+    // We assume a_q_dim <= kBlockM
+    // if (tidx == 0) {
+    //     unsigned long k_offset = (unsigned long) binfo.k_offset(params.a_batch_stride, params.a_row_stride, bidb);
+    //     unsigned long kk_offset = (unsigned long) binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb);
+    //     printf("batch idx=%d, k_offset=%lu, actual_k_offset=%lu", bidb, k_offset, kk_offset);
+    // }
+    Tensor gA = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.p_ptr)
+                                          + binfo.k_offset(params.a_batch_stride, params.a_row_stride, bidb)
+                                          + bidh * params.a_q_dim  // offset to current head
+                                          + n_block * n_block_stride_A),  // offset to last N block
+                            make_shape(Int<kBlockM>{}, Int<kBlockN>{}),
+                            make_stride(_1{}, params.a_row_stride));  // swap strides to transpose
     Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p),
                             Shape<Int<kBlockM>, Int<kBlockN>>{},
                             make_stride(params.seqlen_k_rounded, _1{}));
@@ -188,6 +205,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor tSrK  = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
     Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);                // (MMA, MMA_K,MMA_N)
 
+    // Follow same partitioning scheme as gP within each gA tile
+    Tensor tSgA  = thr_mma.partition_C(gA);                                    // (MMA,MMA_M,MMA_N)
     Tensor tSgS  = thr_mma.partition_C(gP);
 
     Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
@@ -221,6 +240,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // Construct identity layout for sQ and sK
     Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
     Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));    // (BLK_N,BLK_K) -> (blk_n,blk_k)
+    Tensor cA = make_identity_tensor(make_shape(size<0>(gA), size<1>(gA)));     // (BLK_M,BLK_N) -> (blk_m,blk_n)
     // Tensor tScQ = thr_mma.partition_A(cQ);                           // (MMA,MMA_M,MMA_K)
     // if (cute::thread0()) {
     //     print(tScQ.layout()); printf("\n");
@@ -237,10 +257,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // Repeat the partitioning with identity layouts
     Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);       // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
     Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);   // (BCPY,BCPY_N,BCPY_K) -> (blk_n,blk_k)
+    Tensor tAcA = thr_mma.partition_C(cA);                // (MMA,MMA_M,MMA_N) -> (blk_m,blk_n)
 
     // Allocate predicate tensors for k
     Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
     Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));
+    Tensor tApA = make_tensor<bool>(make_shape(size<0>(tSgA), size<1>(tSgA), size<2>(tSgA)));
+    Tensor tApAlastN = make_tensor<bool>(make_shape(size<0>(tSgA), size<1>(tSgA), size<2>(tSgA)));
 
     // Set predicates for k bounds
     if (!Is_even_K) {
@@ -249,6 +272,38 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         #pragma unroll
         for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(0, 0, k)) < params.d; }
     }
+
+    // Set predicates for q bounds
+    const int seqlen_q_rounded = binfo.actual_seqlen_q;
+    const int min_q_agg = seqlen_q_rounded - params.key_attn_agg_window;
+    const int max_q_agg = seqlen_q_rounded - 1;
+    const int min_key_agg_mblock = min_q_agg / kBlockM;
+    const int max_key_agg_mblock = max_q_agg / kBlockM;
+    const bool is_min_key_agg_mblock = m_block == min_key_agg_mblock;
+    const bool is_max_key_agg_mblock = m_block == max_key_agg_mblock;
+    const int k_len_remainder = (!is_max_key_agg_mblock || (binfo.actual_seqlen_k % kBlockN == 0)) ? kBlockN : binfo.actual_seqlen_k % kBlockN;
+    // should have at most 2 M-blocks that we aggregate queries for
+    const bool is_key_agg_mblock = is_min_key_agg_mblock || is_max_key_agg_mblock;
+    const int key_agg_mblock_start_ = min_q_agg % kBlockM;
+    const int key_agg_mblock_start = is_min_key_agg_mblock ? key_agg_mblock_start_ : 0;
+    const int key_agg_mblock_end = is_max_key_agg_mblock ? (max_q_agg % kBlockM) + 1 : kBlockM;
+    if (Aggregate_key_attn) {
+        for (int mma = 0; mma < size<0>(tApA); ++mma) {
+            for (int m = 0; m < size<1>(tApA); ++m) {
+                for (int n = 0; n < size<2>(tApA); ++n) {
+                    tApA(mma, m, n) = (get<0>(tAcA(mma, m, n)) >= key_agg_mblock_start)
+                                      && (get<0>(tAcA(mma, m, n)) < key_agg_mblock_end);
+                    tApAlastN(mma, m, n) = tApA(mma, m, n) && (get<1>(tAcA(mma, m, n)) < k_len_remainder);
+                }
+            }
+        }
+    }
+    // Align first query in m-block with first query in q-agg range that this block will process
+    const int key_agg_mblock_offset = is_min_key_agg_mblock ? (-key_agg_mblock_start_) : (kBlockM - key_agg_mblock_start_);
+    // if (Aggregate_key_attn && (bidb == 0) && (bidh == 0) && (tidx == 0)) {
+    //     printf("\n\nm_block=%d, key_agg_mblock_offset=%d, key_agg_mblock_start=%d, key_agg_mblock_end=%d", m_block, key_agg_mblock_offset, key_agg_mblock_start, key_agg_mblock_end);
+    // }
+    tSgA.data() = tSgA.data() + key_agg_mblock_offset;
 
     // Prologue
 
@@ -270,7 +325,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         __syncthreads();
     }
 
-    int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
@@ -306,6 +360,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
+        const int last_n_block = masking_step == 0;
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
         flash::cp_async_wait<0>();
@@ -343,22 +398,42 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             // isn't right and we get race conditions.
             cute::cp_async_fence();
         }
+        // copy attention before block-rescale so we can normalize with global lse later
+        if (Aggregate_key_attn && is_key_agg_mblock) {
+            // if (tidx == 0 && bidh == 0) {
+            //     printf("\nmasking step %d (bidb=%d, n_block=%d, m_block=%d, agg_key_attn=%d, tSgA ptr=%lu)", masking_step, bidb, n_block, m_block, Aggregate_key_attn, tSgA.data());
+            // }
+            if (last_n_block) {
+                cute::copy_if(tApAlastN, acc_s, tSgA);
+            } else {
+                cute::copy_if(tApA, acc_s, tSgA);
+            }
+            tSgA.data() = tSgA.data() + (-n_block_stride_A);
+        }
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
         masking_step == 0
             ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
             : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
+        // acc_s = attention matrix block
+        // acc_o = tensor of shape [q, d] (acc_s X K)
+        // rescales acc_s based on local lse, then aggregates the local lse into running lse of the softmax.template object
+
+        // copy acc_s to gmem only if we care about current query block (can we copy only the queries we care about in the block?)
+
         // Convert acc_s from fp32 to fp16/bf16
         Tensor rP = flash::convert_type<Element>(acc_s);
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
         int block_col_idx = n_block * (kBlockN / 32);
-        if (Return_softmax) {
+        if (Return_softmax && !Aggregate_key_attn) {
             Tensor rP_drop = make_fragment_like(rP);
             cute::copy(rP, rP_drop);
-            dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-                rP_drop, block_row_idx, block_col_idx, kNWarps
-            );
+            if (Is_dropout) {
+                dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+                    rP_drop, block_row_idx, block_col_idx, kNWarps
+                );
+            }
             cute::copy(rP_drop, tSgS);
             tSgS.data() = tSgS.data() + (-kBlockN);
         }
@@ -410,17 +485,27 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
 
+        if (Aggregate_key_attn && is_key_agg_mblock) {
+            // if (tidx == 0 && bidb == 0 && bidh == 0) {
+            //     printf("\nnon-masking step %d (n_block=%d, m_block=%d, agg_key_attn=%d, tSgA ptr=%lu)", non_masking_step, n_block, m_block, Aggregate_key_attn, tSgA.data());
+            // }
+            // Apply additional masking to rP here if necessary
+            cute::copy_if(tApA, acc_s, tSgA);
+            tSgA.data() = tSgA.data() + (-n_block_stride_A);
+        }
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
         Tensor rP = flash::convert_type<Element>(acc_s);
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
         int block_col_idx = n_block * (kBlockN / 32);
-        if (Return_softmax) {
+        if (Return_softmax && !Aggregate_key_attn) {
             Tensor rP_drop = make_fragment_like(rP);
             cute::copy(rP, rP_drop);
-            dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
-                rP_drop, block_row_idx, block_col_idx, kNWarps
-            );
+            if (Is_dropout) {
+                dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+                    rP_drop, block_row_idx, block_col_idx, kNWarps
+                );
+            }
             cute::copy(rP_drop, tSgS);
             tSgS.data() = tSgS.data() + (-kBlockN);
         }
@@ -1102,7 +1187,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, bool Aggregate_key_attn, typename Params>
 inline __device__ void compute_attn(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1118,7 +1203,7 @@ inline __device__ void compute_attn(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-    flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
+    flash::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, Aggregate_key_attn>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

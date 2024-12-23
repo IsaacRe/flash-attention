@@ -54,6 +54,12 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ o_ptr;
     void * __restrict__ oaccum_ptr;
 
+    // The stride between rows of A
+    index_t a_q_dim;
+    index_t a_batch_stride;
+    index_t a_row_stride;
+    index_t a_head_stride;
+
     // The stride between rows of O.
     index_t o_batch_stride;
     index_t o_row_stride;
@@ -61,6 +67,12 @@ struct Flash_fwd_params : public Qkv_params {
 
     // The pointer to the P matrix.
     void * __restrict__ p_ptr;
+
+    // Whether to return whole attention matrix
+    bool return_softmax;
+
+    // Number of final queries for which to return the attention matrix
+    int key_attn_agg_window;
 
     // The pointer to the softmax sum.
     void * __restrict__ softmax_lse_ptr;

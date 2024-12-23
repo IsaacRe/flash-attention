@@ -38,7 +38,8 @@ void set_params_fprop(Flash_fwd_params &params,
                       void *cu_seqlens_q_d,
                       void *cu_seqlens_k_d,
                       void *seqused_k,
-                      void *p_d,
+                      const c10::optional<at::Tensor> p,
+                      int key_attn_agg_window,
                       void *softmax_lse_d,
                       float p_dropout,
                       float softmax_scale,
@@ -93,7 +94,25 @@ void set_params_fprop(Flash_fwd_params &params,
     params.seqused_k = static_cast<int *>(seqused_k);
 
     // P = softmax(QK^T)
-    params.p_ptr = p_d;
+    params.return_softmax = false;
+    if (p.has_value() && p.value().defined()) {
+        const at::Tensor pt = p.value();
+        params.p_ptr = pt.data_ptr();
+
+        if (key_attn_agg_window > 0) {
+            params.a_row_stride = pt.stride(-3);
+            params.a_head_stride = pt.stride(-2);
+            params.a_q_dim = pt.size(-1);
+            if (cu_seqlens_q_d == nullptr) {
+                params.a_batch_stride = pt.stride(0);
+            }
+        } else {
+            params.return_softmax = true;
+        }
+    }
+
+    // Window of final queries over which we return attention
+    params.key_attn_agg_window = key_attn_agg_window;
 
     // Softmax sum
     params.softmax_lse_ptr = softmax_lse_d;
@@ -400,7 +419,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
                      /*cu_seqlens_q_d=*/nullptr,
                      /*cu_seqlens_k_d=*/nullptr,
                      /*seqused_k=*/nullptr,
-                     return_softmax ? p.data_ptr() : nullptr,
+                     p,
+                     /*key_attn_agg_window=*/0,
                      softmax_lse.data_ptr(),
                      p_dropout,
                      softmax_scale,
@@ -478,6 +498,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                int64_t window_size_right,
                const double softcap,
                const bool return_softmax,
+               const bool aggregate_key_attn,
+               const int64_t key_attn_agg_window,
                c10::optional<at::Generator> gen_) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -637,14 +659,21 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     at::Tensor p;
     // Only return softmax if there's dropout to reduce compilation time
     if (return_softmax) {
-        TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
         p = torch::empty({ batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded }, opts);
+    } else if (aggregate_key_attn) {
+        assert(!paged_KV);
+        const int total_k = k.size(0);
+        // Hack: for now hardcode in KernelTrait of kBlockM=128
+        const int a_q_dim = key_attn_agg_window; //(key_attn_agg_window / 128 + 1) * 128;
+        p = torch::empty({ total_k, num_heads, a_q_dim }, opts.dtype(at::kFloat));
+        // p = torch::empty({ batch_size * seq_len_k_rounded, num_heads, seqlen_q_rounded }, opts);
     }
 
     if (zero_tensors) {
         out.zero_();
         softmax_lse.fill_(-std::numeric_limits<float>::infinity());
         if (return_softmax) {p.zero_();}
+        else if (aggregate_key_attn) {p.fill_(-std::numeric_limits<float>::infinity());}
     }
 
     Flash_fwd_params params;
@@ -658,7 +687,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      cu_seqlens_q_d,
                      cu_seqlens_k.data_ptr(),
                      seqused_k.has_value() ? seqused_k.value().data_ptr() : nullptr,
-                     return_softmax ? p.data_ptr() : nullptr,
+                     p,
+                     key_attn_agg_window,
                      softmax_lse.data_ptr(),
                      p_dropout,
                      softmax_scale,
@@ -893,6 +923,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
 
+    at::Tensor p;
     Flash_fwd_params params;
     set_params_fprop(params,
                      batch_size,
@@ -904,7 +935,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      /*cu_seqlens_q_d=*/nullptr,
                      /*cu_seqlens_k_d=*/nullptr,
                      /*seqused_k=*/nullptr,
-                     /*p_ptr=*/nullptr,
+                     /*p_ptr=*/p,
+                     /*key_attn_agg_window=*/0,
                      softmax_lse.data_ptr(),
                      /*p_dropout=*/0.f,
                      softmax_scale,
@@ -1054,7 +1086,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? block_table, Tensor? alibi_slopes, "
             "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "
             "bool is_causal, int window_size_left, int window_size_right, float softcap, bool return_softmax, "
-            "Generator? gen) -> Tensor[]");
+            "bool aggregate_key_attn, int key_attn_agg_window, Generator? gen) -> Tensor[]");
     ops.impl("varlen_fwd", torch::kCUDA, &mha_varlen_fwd);
 
     ops.def("fwd_kvcache(Tensor! q, Tensor kcache, Tensor vcache, Tensor? k, Tensor? v, Tensor? seqlens_k, "

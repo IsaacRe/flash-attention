@@ -4,19 +4,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from flash_attn_kvc import (
-    # flash_attn_func,
-    # flash_attn_kvpacked_func,
-    # flash_attn_qkvpacked_func,
-    flash_attn_varlen_func,
-    # flash_attn_varlen_kvpacked_func,
-    # flash_attn_varlen_qkvpacked_func,
-    # flash_attn_with_kvcache,
-    convert_kvc_S_to_attn,
-)
-from flash_attn_kvc.bert_padding import pad_input, unpad_input
-from flash_attn_kvc.flash_attn_interface import _get_block_size_n
-from flash_attn_kvc.layers.rotary import apply_rotary_emb
+
+import flash_attn_wrapper  # noqa: F401
+
+# from flash_attn_kvc.bert_padding import pad_input, unpad_input
+from vllm_flash_attn.flash_attn_interface import _get_block_size_n
 
 MAX_HEADDIM_SM8x = 192
 

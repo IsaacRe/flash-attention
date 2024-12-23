@@ -4,6 +4,7 @@ from typing import Optional, Union
 
 import torch
 import torch.nn as nn
+import math
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
@@ -11,6 +12,27 @@ import torch.nn as nn
 from . import vllm_flash_attn_c # noqa: F401
 
 # isort: on
+
+
+def convert_kvc_S_to_attn(s, sm_lse, kagg_window, cu_seqlens, d):
+    assert s.dtype == sm_lse.dtype == torch.float
+    scale = math.sqrt(d)
+    s_ = s / scale
+    start = cu_seqlens[0]
+    lse = []
+    for l in cu_seqlens[1:]:
+        curr_l = l - start
+        nq = min(kagg_window, curr_l)
+        lse = sm_lse[:,l-nq:l]
+        s_[start:l,:,-nq:] -= lse[None]
+
+        start = l
+
+    s_ = s_.exp()
+    s_[s == float('-inf')] = 0
+
+    return s_
+
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -30,7 +52,7 @@ def _get_block_size_n(device, head_dim, is_dropout, is_causal):
         return 64
     elif head_dim <= 128:
         if is_sm8x:
-            return 64 if (not is_dropout and is_causal) else 32
+            return 64  # if (not is_dropout and is_causal) else 32
         else:
             return 64 if not is_dropout else 32
     elif head_dim <= 160:
@@ -83,6 +105,7 @@ def _flash_attn_varlen_forward(
     softcap,
     alibi_slopes,
     return_softmax,
+    key_attn_agg_window,
     block_table,
     *,
     out=None
@@ -102,12 +125,14 @@ def _flash_attn_varlen_forward(
         max_seqlen_k,
         dropout_p,
         softmax_scale,
-        False,
+        True,  # (zero tensors) TODO for now while debugging
         causal,
         window_size[0],
         window_size[1],
         softcap,
         return_softmax,
+        key_attn_agg_window > 0,
+        key_attn_agg_window,
         None,
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
@@ -330,6 +355,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            key_attn_agg_window=0,
             block_table=None,
             out=out,
         )
@@ -484,6 +510,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            key_attn_agg_window=0,
             block_table=None,
             out=out,
         )
@@ -625,6 +652,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         alibi_slopes,
         deterministic,
         return_softmax,
+        key_attn_agg_window,
         block_table,
         out=None,
     ):
@@ -644,7 +672,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             window_size=window_size,
             softcap=softcap,
             alibi_slopes=alibi_slopes,
-            return_softmax=return_softmax and dropout_p > 0,
+            return_softmax=return_softmax,
+            key_attn_agg_window=key_attn_agg_window,
             block_table=block_table,
             out=out,
         )
@@ -660,7 +689,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
-        return out if not return_softmax else (out, softmax_lse, S_dmask)
+        return out if not (return_softmax or key_attn_agg_window > 0) else (out, softmax_lse, S_dmask)
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -1093,6 +1122,7 @@ def flash_attn_varlen_func(
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
+    key_attn_agg_window=0,
     block_table=None,
     *,
     out=None,
@@ -1168,6 +1198,7 @@ def flash_attn_varlen_func(
         alibi_slopes,
         deterministic,
         return_attn_probs,
+        key_attn_agg_window,
         block_table,
         out,
     )

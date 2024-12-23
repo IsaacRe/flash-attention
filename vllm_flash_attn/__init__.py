@@ -9,4 +9,5 @@ from .flash_attn_interface import (
     flash_attn_varlen_kvpacked_func,
     flash_attn_varlen_qkvpacked_func,
     flash_attn_with_kvcache,
+    convert_kvc_S_to_attn,
 )
