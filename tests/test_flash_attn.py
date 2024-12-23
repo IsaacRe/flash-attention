@@ -7,8 +7,8 @@ from einops import rearrange, repeat
 
 import flash_attn_wrapper  # noqa: F401
 
-# from flash_attn_kvc.bert_padding import pad_input, unpad_input
-from vllm_flash_attn.flash_attn_interface import _get_block_size_n
+from vllm_flash_attn.bert_padding import pad_input, unpad_input
+from vllm_flash_attn.flash_attn_interface import _get_block_size_n, convert_kvc_S_to_attn
 
 MAX_HEADDIM_SM8x = 192
 
@@ -779,7 +779,7 @@ def test_flash_attn_varlen_output(
             dq_pad_fn,
             dkv_pad_fn,
         ) = generate_qkv(q, *kv.unbind(dim=2), query_padding_mask, key_padding_mask, kvpacked=True)
-        out_unpad, sm_lse, S_dmask = flash_attn_varlen_kvpacked_func(
+        out_unpad, sm_lse, S_dmask = torch.ops.vllm.flash_attn_varlen_kvpacked_func(
             q_unpad,
             kv_unpad,
             cu_seqlens_q,
@@ -810,7 +810,7 @@ def test_flash_attn_varlen_output(
             dq_pad_fn,
             dk_pad_fn,
         ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
-        out_unpad, sm_lse, S_dmask = flash_attn_varlen_func(
+        out_unpad, sm_lse, S_dmask = torch.ops.vllm.flash_attn_varlen_func(
             q_unpad.clone(),
             k_unpad.clone(),
             v_unpad.clone(),
@@ -827,7 +827,7 @@ def test_flash_attn_varlen_output(
             return_attn_probs=key_attn_agg_window == 0,
             key_attn_agg_window=key_attn_agg_window,
         )
-        _, sm_lse_, S_dmask_ = flash_attn_varlen_func(
+        _, sm_lse_, S_dmask_ = torch.ops.vllm.flash_attn_varlen_func(
             q_unpad,
             k_unpad,
             v_unpad,
@@ -1288,7 +1288,7 @@ def test_flash_attn_varlen_output_old(
             dq_pad_fn,
             dkv_pad_fn,
         ) = generate_qkv(q, *kv.unbind(dim=2), query_padding_mask, key_padding_mask, kvpacked=True)
-        out_unpad, sm_lse, S_dmask = flash_attn_varlen_kvpacked_func(
+        out_unpad, sm_lse, S_dmask = torch.ops.vllm.flash_attn_varlen_kvpacked_func(
             q_unpad,
             kv_unpad,
             cu_seqlens_q,
@@ -1319,7 +1319,7 @@ def test_flash_attn_varlen_output_old(
             dq_pad_fn,
             dk_pad_fn,
         ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
-        out_unpad, sm_lse, S_dmask = flash_attn_varlen_func(
+        out_unpad, sm_lse, S_dmask = torch.ops.vllm.flash_attn_varlen_func(
             q_unpad,
             k_unpad,
             v_unpad,

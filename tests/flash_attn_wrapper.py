@@ -3,7 +3,49 @@ import torch
 
 from vllm_flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func
 from vllm_flash_attn import flash_attn_with_kvcache as _flash_attn_with_kvcache
+from vllm_flash_attn import flash_attn_varlen_kvpacked_func as _flash_attn_varlen_kvpacked_func
 
+
+@torch.library.custom_op("vllm::flash_attn_varlen_kvpacked_func", mutates_args=[])
+def flash_attn_varlen_kvpacked_func(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        dropout_p: float = 0.0,
+        softmax_scale: Optional[float] = None,
+        causal: bool = False,
+        window_size: Optional[List[int]] = None,
+        softcap: float = 0.0,
+        alibi_slopes: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
+        return_attn_probs: bool = False,
+):
+    # custom op does not support tuple input
+    real_window_size: Tuple[int, int]
+    if window_size is None:
+        real_window_size = (-1, -1)
+    else:
+        assert len(window_size) == 2
+        real_window_size = (window_size[0], window_size[1])
+    return _flash_attn_varlen_kvpacked_func(
+        q=q,
+        kv=kv,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=real_window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_attn_probs=return_attn_probs,
+    )
 
 @torch.library.custom_op("vllm::flash_attn_varlen_func", mutates_args=[])
 def flash_attn_varlen_func(
@@ -20,6 +62,8 @@ def flash_attn_varlen_func(
         softcap: float = 0.0,
         alibi_slopes: Optional[torch.Tensor] = None,
         block_table: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
+        return_attn_probs: bool = False,
 ) -> torch.Tensor:
     # custom op does not support tuple input
     real_window_size: Tuple[int, int]
@@ -42,6 +86,8 @@ def flash_attn_varlen_func(
         softcap=softcap,
         alibi_slopes=alibi_slopes,
         block_table=block_table,
+        deterministic=deterministic,
+        return_attn_probs=return_attn_probs,
     )
 
 
@@ -60,6 +106,8 @@ def _(
         softcap: float = 0.0,
         alibi_slopes: Optional[torch.Tensor] = None,
         block_table: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
+        return_attn_probs: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -75,6 +123,7 @@ def flash_attn_with_kvcache(
         causal: bool = False,
         alibi_slopes: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
+        **kwargs,
 ) -> torch.Tensor:
     return _flash_attn_with_kvcache(
         decode_query,
@@ -86,6 +135,7 @@ def flash_attn_with_kvcache(
         causal=causal,
         alibi_slopes=alibi_slopes,
         softcap=softcap,
+        **kwargs,
     )
 
 @flash_attn_with_kvcache.register_fake  # type: ignore
@@ -99,5 +149,6 @@ def _(
         causal: bool = False,
         alibi_slopes: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
+        **kwargs,
 ) -> torch.Tensor:
     return torch.empty_like(decode_query)

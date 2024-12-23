@@ -34,6 +34,26 @@ def convert_kvc_S_to_attn(s, sm_lse, kagg_window, cu_seqlens, d):
     return s_
 
 
+def convert_kvc_S_to_attn(s, sm_lse, kagg_window, cu_seqlens, d):
+    assert s.dtype == sm_lse.dtype == torch.float
+    scale = math.sqrt(d)
+    s_ = s / scale
+    start = cu_seqlens[0]
+    lse = []
+    for l in cu_seqlens[1:]:
+        curr_l = l - start
+        nq = min(kagg_window, curr_l)
+        lse = sm_lse[:,l-nq:l]
+        s_[start:l,:,-nq:] -= lse[None]
+
+        start = l
+
+    s_ = s_.exp()
+    s_[s == float('-inf')] = 0
+
+    return s_
+
+
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
