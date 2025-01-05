@@ -657,15 +657,19 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     auto opts = q.options();
     auto softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
     at::Tensor p;
-    // Only return softmax if there's dropout to reduce compilation time
     if (return_softmax) {
         p = torch::empty({ batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded }, opts);
     } else if (aggregate_key_attn) {
-        assert(!paged_KV);
-        const int total_k = k.size(0);
+        // seqlens_k always cumulative for varlen_fwd
+        const int total_k = paged_KV ? cu_seqlens_k.index({-1}).item<int>() : k.size(0);
         // Hack: for now hardcode in KernelTrait of kBlockM=128
         const int a_q_dim = key_attn_agg_window; //(key_attn_agg_window / 128 + 1) * 128;
-        p = torch::empty({ total_k, num_heads, a_q_dim }, opts.dtype(at::kFloat));
+        if (!is_KVC) {
+            p = torch::empty({ total_k, num_heads, a_q_dim }, opts.dtype(at::kFloat));
+        } else {
+            // In KVC cache, KV heads are expanded along the first dim
+            p = torch::empty({ total_k, ngroups, a_q_dim }, opts.dtype(at::kFloat));
+        }
         // p = torch::empty({ batch_size * seq_len_k_rounded, num_heads, seqlen_q_rounded }, opts);
     }
 
@@ -675,6 +679,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         if (return_softmax) {p.zero_();}
         else if (aggregate_key_attn) {p.fill_(-std::numeric_limits<float>::infinity());}
     }
+
+    std::cout << return_softmax << std::endl;
+    std::cout << "window " << key_attn_agg_window << std::endl;
 
     Flash_fwd_params params;
     set_params_fprop(params,
@@ -744,6 +751,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
+
+    printf("splitkv? %d", !(params.num_splits <= 1));
 
     if (max_seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();

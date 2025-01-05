@@ -22,7 +22,7 @@ def flash_attn_varlen_kvpacked_func(
         alibi_slopes: Optional[torch.Tensor] = None,
         deterministic: bool = False,
         return_attn_probs: bool = False,
-):
+) -> List[torch.Tensor]:
     # custom op does not support tuple input
     real_window_size: Tuple[int, int]
     if window_size is None:
@@ -30,7 +30,7 @@ def flash_attn_varlen_kvpacked_func(
     else:
         assert len(window_size) == 2
         real_window_size = (window_size[0], window_size[1])
-    return _flash_attn_varlen_kvpacked_func(
+    out = _flash_attn_varlen_kvpacked_func(
         q=q,
         kv=kv,
         cu_seqlens_q=cu_seqlens_q,
@@ -46,6 +46,30 @@ def flash_attn_varlen_kvpacked_func(
         deterministic=deterministic,
         return_attn_probs=return_attn_probs,
     )
+    if isinstance(out, tuple):
+        return list(out)
+    return [out]
+
+
+@flash_attn_varlen_kvpacked_func.register_fake
+def _(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        dropout_p: float = 0.0,
+        softmax_scale: Optional[float] = None,
+        causal: bool = False,
+        window_size: Optional[List[int]] = None,
+        softcap: float = 0.0,
+        alibi_slopes: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
+        return_attn_probs: bool = False,
+) -> List[torch.Tensor]:
+    return [torch.empty_like(q)]
+
 
 @torch.library.custom_op("vllm::flash_attn_varlen_func", mutates_args=[])
 def flash_attn_varlen_func(
@@ -64,7 +88,8 @@ def flash_attn_varlen_func(
         block_table: Optional[torch.Tensor] = None,
         deterministic: bool = False,
         return_attn_probs: bool = False,
-) -> torch.Tensor:
+        key_attn_agg_window: int = 0,
+) -> List[torch.Tensor]:
     # custom op does not support tuple input
     real_window_size: Tuple[int, int]
     if window_size is None:
@@ -72,7 +97,7 @@ def flash_attn_varlen_func(
     else:
         assert len(window_size) == 2
         real_window_size = (window_size[0], window_size[1])
-    return _flash_attn_varlen_func(
+    out = _flash_attn_varlen_func(
         q=q,
         k=k,
         v=v,
@@ -88,7 +113,11 @@ def flash_attn_varlen_func(
         block_table=block_table,
         deterministic=deterministic,
         return_attn_probs=return_attn_probs,
+        key_attn_agg_window=key_attn_agg_window,
     )
+    if isinstance(out, tuple):
+        return list(out)
+    return [out]
 
 
 @flash_attn_varlen_func.register_fake  # type: ignore
@@ -108,8 +137,9 @@ def _(
         block_table: Optional[torch.Tensor] = None,
         deterministic: bool = False,
         return_attn_probs: bool = False,
-) -> torch.Tensor:
-    return torch.empty_like(q)
+        key_attn_agg_window: int = 0,
+) -> List[torch.Tensor]:
+    return [torch.empty_like(q)]
 
 
 @torch.library.custom_op("vllm::flash_attn_with_kvcache", mutates_args=[])
@@ -123,7 +153,6 @@ def flash_attn_with_kvcache(
         causal: bool = False,
         alibi_slopes: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
-        **kwargs,
 ) -> torch.Tensor:
     return _flash_attn_with_kvcache(
         decode_query,
@@ -135,7 +164,6 @@ def flash_attn_with_kvcache(
         causal=causal,
         alibi_slopes=alibi_slopes,
         softcap=softcap,
-        **kwargs,
     )
 
 @flash_attn_with_kvcache.register_fake  # type: ignore
@@ -149,6 +177,5 @@ def _(
         causal: bool = False,
         alibi_slopes: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
-        **kwargs,
 ) -> torch.Tensor:
     return torch.empty_like(decode_query)

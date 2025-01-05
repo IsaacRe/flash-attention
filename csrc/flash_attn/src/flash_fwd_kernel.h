@@ -63,6 +63,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     // Shared memory.
     extern __shared__ char smem_[];
 
+    if (cute::thread0()) {
+        printf("In standard attn block: agg? %d\n", Aggregate_key_attn);
+    }
+
     // The thread index.
     const int tidx = threadIdx.x;
 
@@ -398,11 +402,15 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             // isn't right and we get race conditions.
             cute::cp_async_fence();
         }
+        if (cute::thread0()) {
+            cute::print_tensor(acc_s);
+        }
         // copy attention before block-rescale so we can normalize with global lse later
         if (Aggregate_key_attn && is_key_agg_mblock) {
-            // if (tidx == 0 && bidh == 0) {
-            //     printf("\nmasking step %d (bidb=%d, n_block=%d, m_block=%d, agg_key_attn=%d, tSgA ptr=%lu)", masking_step, bidb, n_block, m_block, Aggregate_key_attn, tSgA.data());
-            // }
+            if (tidx == 0 && bidh == 0) {
+                // printf("\nmasking step %d (bidb=%d, n_block=%d, m_block=%d, agg_key_attn=%d, tSgA ptr=%lu)", masking_step, bidb, n_block, m_block, Aggregate_key_attn, tSgA.data());
+                printf("\nmasking step %d (bidb=%d, n_block=%d, m_block=%d, agg_key_attn=%d)", masking_step, bidb, n_block, m_block, Aggregate_key_attn);
+            }
             if (last_n_block) {
                 cute::copy_if(tApAlastN, acc_s, tSgA);
             } else {
@@ -586,7 +594,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, bool Aggregate_key_attn, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
 
     using Element = typename Kernel_traits::Element;
@@ -595,6 +603,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // Shared memory.
     extern __shared__ char smem_[];
+
+    if (cute::thread0()) {
+        printf("In splitkv attn block: agg? %d\n", Aggregate_key_attn);
+    }
 
     // The thread index.
     const int tidx = threadIdx.x;
@@ -628,6 +640,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
     }
     if (n_block_min >= n_block_max) {  // This also covers the case where n_block_max <= 0
+        if (tidx == 0 && bidh == 0) {
+            printf("exiting early\n");
+        }
         // We exit early and write 0 to gOaccum and -inf to gLSEaccum.
         // Otherwise we might read OOB elements from gK and gV,
         // or get wrong results when we combine gOaccum from different blocks.
@@ -668,6 +683,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         return;
     }
 
+    int n_block = n_block_max - 1;
+    const int n_block_stride_A = params.a_row_stride * kBlockN;
+
     // We iterate over the blocks in reverse order. This is because the last block is the only one
     // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
     // might save us 1 register (we just need n_block instead of both n_block and n_block_max).
@@ -702,6 +720,22 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.v_ptr) + row_offset_v),
                             Shape<Int<kBlockN>, Int<kHeadDim>>{},
                             make_stride(params.v_row_stride, _1{}));
+    const int head_index_A = (params.is_kvc_cache) ? bidh / params.h_h_k_ratio : bidh;
+    const int offset_A_k = binfo.k_offset(params.a_batch_stride, params.a_row_stride, bidb);
+    const int offset_A_head = head_index_A * params.a_q_dim;
+    const int offset_A_n = n_block * n_block_stride_A;
+    const int offset_A = binfo.k_offset(params.a_batch_stride, params.a_row_stride, bidb)
+                        + head_index_A * params.a_q_dim  // offset to current head
+                        + n_block * n_block_stride_A;
+    if (tidx == 0 && bidh == 0) {
+        printf("n_block_min=%d n_block_max=%d m_block=%d kBlockM=%d kBlockN=%d offset_A=%d k=%d head=%d n=%d\n", n_block_min, n_block_max, m_block, kBlockM, kBlockN, offset_A, offset_A_k, offset_A_head, offset_A_n);
+    }
+    Tensor gA = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.p_ptr)
+                                          + binfo.k_offset(params.a_batch_stride, params.a_row_stride, bidb)
+                                          + head_index_A * params.a_q_dim  // offset to current head
+                                          + n_block * n_block_stride_A),  // offset to last N block
+                            make_shape(Int<kBlockM>{}, Int<kBlockN>{}),
+                            make_stride(_1{}, params.a_row_stride));  // swap strides to transpose
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQ{});
     Tensor sK = make_tensor(sQ.data() + size(sQ), typename Kernel_traits::SmemLayoutKV{});
@@ -737,12 +771,14 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         tKgK.data() = gK.data() + tKgK_offset;
         tVgV.data() = gV.data() + tVgV_offset;
     }
+    // TODO: set A offset
 
     typename Kernel_traits::TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tidx);
     Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)
     Tensor tSrK  = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
     Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);                // (MMA, MMA_K,MMA_N)
+    Tensor tSgA  = thr_mma.partition_C(gA);                                    // (MMA,MMA_M,MMA_N)
 
     Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
 
@@ -772,15 +808,19 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // Construct identity layout for sQ and sK
     Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
     Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));    // (BLK_N,BLK_K) -> (blk_n,blk_k)
+    Tensor cA = make_identity_tensor(make_shape(size<0>(gA), size<1>(gA)));     // (BLK_M,BLK_N) -> (blk_m,blk_n)
 
     // Repeat the partitioning with identity layouts
     Tensor tQcQ = gmem_thr_copy_Q.partition_S(cQ);       // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
     Tensor tKVcKV_ = gmem_thr_copy_KV.partition_S(cKV);   // (BCPY,BCPY_N,BCPY_K) -> (blk_n,blk_k)
     Tensor tKVcKV = make_tensor(tKVcKV_.data(), reshape_thread_tile(tKVcKV_.layout()));
+    Tensor tAcA = thr_mma.partition_C(cA);                // (MMA,MMA_M,MMA_N) -> (blk_m,blk_n)
 
     // Allocate predicate tensors for k
     Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
     Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));
+    Tensor tApA = make_tensor<bool>(make_shape(size<0>(tSgA), size<1>(tSgA), size<2>(tSgA)));
+    Tensor tApAlastN = make_tensor<bool>(make_shape(size<0>(tSgA), size<1>(tSgA), size<2>(tSgA)));
 
     // Set predicates for k bounds
     if (!Is_even_K) {
@@ -788,6 +828,42 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         for (int k = 0; k < size(tQpQ); ++k) { tQpQ(k) = get<1>(tQcQ(0, 0, k)) < params.d; }
         #pragma unroll
         for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(0, 0, k)) < params.d; }
+    }
+
+    // Set predicates for q bounds
+    const int seqlen_q_rounded = binfo.actual_seqlen_q;
+    const int min_q_agg = seqlen_q_rounded - params.key_attn_agg_window;
+    const int max_q_agg = seqlen_q_rounded - 1;
+    const int min_key_agg_mblock = min_q_agg / kBlockM;
+    const int max_key_agg_mblock = max_q_agg / kBlockM;
+    const bool is_min_key_agg_mblock = m_block == min_key_agg_mblock;
+    const bool is_max_key_agg_mblock = m_block == max_key_agg_mblock;
+    const int k_len_remainder = (!is_max_key_agg_mblock || (binfo.actual_seqlen_k % kBlockN == 0)) ? kBlockN : binfo.actual_seqlen_k % kBlockN;
+    // should have at most 2 M-blocks that we aggregate queries for
+    const bool is_key_agg_mblock = is_min_key_agg_mblock || is_max_key_agg_mblock;
+    const int key_agg_mblock_start_ = min_q_agg % kBlockM;
+    const int key_agg_mblock_start = is_min_key_agg_mblock ? key_agg_mblock_start_ : 0;
+    const int key_agg_mblock_end = is_max_key_agg_mblock ? (max_q_agg % kBlockM) + 1 : kBlockM;
+    if (Aggregate_key_attn) {
+        for (int mma = 0; mma < size<0>(tApA); ++mma) {
+            for (int m = 0; m < size<1>(tApA); ++m) {
+                for (int n = 0; n < size<2>(tApA); ++n) {
+                    tApA(mma, m, n) = (get<0>(tAcA(mma, m, n)) >= key_agg_mblock_start)
+                                      && (get<0>(tAcA(mma, m, n)) < key_agg_mblock_end);
+                    tApAlastN(mma, m, n) = tApA(mma, m, n) && (get<1>(tAcA(mma, m, n)) < k_len_remainder);
+                }
+            }
+        }
+    }
+    // Align first query in m-block with first query in q-agg range that this block will process
+    const int key_agg_mblock_offset = is_min_key_agg_mblock ? (-key_agg_mblock_start_) : (kBlockM - key_agg_mblock_start_);
+    // if (Aggregate_key_attn && (bidb == 0) && (bidh == 0) && (tidx == 0)) {
+    //     printf("\n\nm_block=%d, key_agg_mblock_offset=%d, key_agg_mblock_start=%d, key_agg_mblock_end=%d", m_block, key_agg_mblock_offset, key_agg_mblock_start, key_agg_mblock_end);
+    // }
+    tSgA.data() = tSgA.data() + key_agg_mblock_offset;
+
+    if (tidx == 0 && bidh == 0) {
+        printf("key_agg_mblock_offset=%d bidb=%d bidh=%d len=%d", key_agg_mblock_offset, bidb, bidh, binfo.actual_seqlen_k);
     }
 
     // Prologue
@@ -947,7 +1023,6 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         }
     }
 
-    int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
     flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
@@ -1033,6 +1108,21 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             cute::cp_async_fence();
         }
 
+        // copy attention before block-rescale so we can normalize with global lse later
+        if (Aggregate_key_attn && is_key_agg_mblock) {
+            const int last_n_block = masking_step == 0;
+            if (tidx == 0 && bidh == 0) {
+                // printf("\nmasking step %d (bidb=%d, n_block=%d, m_block=%d, agg_key_attn=%d, tSgA ptr=%lu)", masking_step, bidb, n_block, m_block, Aggregate_key_attn, tSgA.data());
+                printf("\nmasking step %d (bidb=%d, n_block=%d, m_block=%d, agg_key_attn=%d)", masking_step, bidb, n_block, m_block, Aggregate_key_attn);
+            }
+            if (last_n_block) {
+                cute::copy_if(tApAlastN, acc_s, tSgA);
+            } else {
+                cute::copy_if(tApA, acc_s, tSgA);
+            }
+            tSgA.data() = tSgA.data() + (-n_block_stride_A);
+        }
+
         // We have key_padding_mask so we'll need to Check_inf
         masking_step == 0
             ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2)
@@ -1055,7 +1145,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     }
 
     // These are the iterations where we don't need masking on S
-    for (; n_block >= n_block_min; --n_block) {
+    for (int step = 0; n_block >= n_block_min; ++step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
         flash::cp_async_wait<0>();
@@ -1097,6 +1187,17 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         mask.template apply_mask</*Causal_mask=*/false>(
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
+
+        // copy attention before block-rescale so we can normalize with global lse later
+        if (Aggregate_key_attn && is_key_agg_mblock) {
+            if (tidx == 0 && bidh == 0) {
+                // printf("\nmasking step %d (bidb=%d, n_block=%d, m_block=%d, agg_key_attn=%d, tSgA ptr=%lu)", masking_step, bidb, n_block, m_block, Aggregate_key_attn, tSgA.data());
+                printf("\nnon-masking step %d (bidb=%d, n_block=%d, m_block=%d, agg_key_attn=%d)", step, bidb, n_block, m_block, Aggregate_key_attn);
+            }
+            cute::copy_if(tApA, acc_s, tSgA);
+            tSgA.data() = tSgA.data() + (-n_block_stride_A);
+        }
+
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
         Tensor rP = flash::convert_type<Element>(acc_s);
@@ -1208,7 +1309,7 @@ inline __device__ void compute_attn(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, bool Aggregate_key_attn, typename Params>
 inline __device__ void compute_attn_splitkv(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1217,7 +1318,7 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
     const int num_n_splits = Split ? gridDim.y : 1;
-    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+    flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV, Aggregate_key_attn>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
