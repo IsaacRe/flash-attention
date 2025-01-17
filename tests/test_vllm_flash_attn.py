@@ -20,14 +20,89 @@ DTYPES = [torch.float16]
 NUM_BLOCKS = [32768, 2048]
 
 
-def convert_kvc_S_to_attn(s, sm_lse, kagg_window, seqlens_q, seqlens_kv, scale, buffer_lens):
+def convert_kvc_S_to_attn_kvc(s, sm_lse, kagg_window, seqlens_q, seqlens_kv,
+                              scale, buffer_lens):
     s = s.to(sm_lse.dtype)
     assert s.dtype == sm_lse.dtype == torch.float
     s_ = s * scale
     start_q = seqlens_q[0]
     start_kv = seqlens_kv[0]
+    num_heads = sm_lse.size(0)
+    num_kv_heads = (seqlens_kv.size(0) - 1) / (seqlens_q.size(0) - 1)
+    seqlens_kv = seqlens_kv[1:]
+    assert int(num_kv_heads) == num_kv_heads
+    num_kv_heads = int(num_kv_heads)
+    kv_per_q = num_heads // num_kv_heads
+    seqlens_q = seqlens_q[1:]
+    assert len(seqlens_kv) == len(buffer_lens)
     min_val = torch.finfo(torch.float).min
-    for lq, lkv, buf in zip(seqlens_q[1:], seqlens_kv[1:], buffer_lens):
+    for s_idx, lq in enumerate(seqlens_q):
+        curr_q = lq - start_q
+        nq = min(kagg_window, curr_q)
+        for kv_head_idx in range(num_kv_heads):
+            packed_idx = s_idx * num_kv_heads + kv_head_idx
+            lkv = seqlens_kv[packed_idx]
+            buf = buffer_lens[packed_idx]
+            q_head_idx = kv_head_idx // kv_per_q
+            curr_lkv = lkv - start_kv
+            offset_kv = curr_lkv - nq
+            attn_mask = 0
+            if buf > 0:
+                raise NotImplementedError("not implemented for uneven q / kv")
+            lse = sm_lse[:,lq-nq:lq]
+            s_[start_kv:lkv,:,-nq:] += (attn_mask - lse[None,q_head_idx])
+
+            start_kv = lkv
+        start_q = lq
+
+    # todo unzip sm_lse head dim and expand to match packed kv heads
+    # for lq, lkv, buf, head_idx in zip(seqlens_q, seqlens_kv, buffer_lens, head_indices):
+    #     curr_q = lq - start_q
+    #     curr_lkv = lkv - start_kv
+    #     nq = min(kagg_window, curr_q)
+    #     offset_kv = curr_lkv - nq
+    #     attn_mask = 0
+    #     if buf > 0:
+    #         raise NotImplementedError("not implemented for uneven q / kv")
+    #         ones = torch.ones_like(s_[start_kv:lkv,:,-nq:])
+    #         attn_mask = torch.triu(ones, diagonal=offset_kv + 1 - buf)
+    #         attn_mask = attn_mask * min_val
+    #     lse = sm_lse[:,lq-nq:lq]
+    #     # lse: [heads X queries]
+    #     # s_[start_kv:lkv,:,-nq:]: [keys X 1 X nq]
+    #     s_[start_kv:lkv,:,-nq:] += (attn_mask - lse[None,head_idx])
+
+    #     start_kv = lkv
+    #     start_q = lq
+
+    s_ = s_.exp()
+    s_[s == float('-inf')] = 0
+
+    return s_
+
+
+def convert_kvc_S_to_attn(s, sm_lse, kagg_window, seqlens_q, seqlens_kv,
+                          scale, buffer_lens, is_kvc=False):
+    s = s.to(sm_lse.dtype)
+    assert s.dtype == sm_lse.dtype == torch.float
+    s_ = s * scale
+    start_q = seqlens_q[0]
+    start_kv = seqlens_kv[0]
+    num_heads = sm_lse.size(0)
+    num_kv_heads = (seqlens_kv.size(0) - 1) / (seqlens_q.size(0) - 1)
+    seqlens_kv = seqlens_kv[1:]
+    if is_kvc:
+        head_indices = list(range(num_heads)) * (num_heads // int(num_kv_heads))
+        assert int(num_kv_heads) == num_kv_heads
+        num_kv_heads = int(num_kv_heads)
+        seqlens_q = seqlens_q[1:].repeat(num_kv_heads)
+    else:
+        head_indices = [None] * len(buffer_lens)
+        seqlens_q = seqlens_q[1:]
+    assert len(head_indices) == len(seqlens_q) == len(seqlens_kv) == len(buffer_lens)
+    min_val = torch.finfo(torch.float).min
+    # todo unzip sm_lse head dim and expand to match packed kv heads
+    for lq, lkv, buf, head_idx in zip(seqlens_q, seqlens_kv, buffer_lens, head_indices):
         curr_q = lq - start_q
         curr_lkv = lkv - start_kv
         nq = min(kagg_window, curr_q)
@@ -39,9 +114,15 @@ def convert_kvc_S_to_attn(s, sm_lse, kagg_window, seqlens_q, seqlens_kv, scale, 
             attn_mask = torch.triu(ones, diagonal=offset_kv + 1 - buf)
             attn_mask = attn_mask * min_val
         lse = sm_lse[:,lq-nq:lq]
-        s_[start_kv:lkv,:,-nq:] += (attn_mask - lse[None])
+        if is_kvc:
+            # lse: [heads X queries]
+            # s_[start_kv:lkv,:,-nq:]: [keys X 1 X nq]
+            s_[start_kv:lkv,:,-nq:] += (attn_mask - lse[None,head_idx])
+        else:
+            s_[start_kv:lkv,:,-nq:] += (attn_mask - lse[None])
 
         start_kv = lkv
+        start_q = lq
 
     s_ = s_.exp()
     s_[s == float('-inf')] = 0
@@ -59,6 +140,8 @@ def ref_paged_attn_kvc(
         scale: float,
         sliding_window: Optional[int] = None,
         soft_cap: Optional[float] = None,
+        causal: bool = True,
+        suffix_attn: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
     block_tables = block_tables.cpu().numpy()
@@ -67,7 +150,7 @@ def ref_paged_attn_kvc(
     _, block_size, head_size = key_cache.shape
 
     outputs: List[torch.Tensor] = []
-    start_idx = 0
+    start_idx = kv_start_idx = 0
     for i in range(num_seqs):
         query_len = query_lens[i]
         q = query[start_idx:start_idx + query_len]
@@ -92,23 +175,33 @@ def ref_paged_attn_kvc(
             k = torch.repeat_interleave(k, queries_per_key, dim=1)
             v = torch.repeat_interleave(v, queries_per_key, dim=1)
             attn = torch.einsum("qhd,khd->hqk", q_, k).float()
-            empty_mask = torch.ones(query_len, kv_len)
-            mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
-            if sliding_window is not None:
-                sliding_window_mask = torch.triu(empty_mask,
-                                                diagonal=kv_len -
-                                                        (query_len + sliding_window) +
-                                                        1).bool().logical_not()
-                mask |= sliding_window_mask
-            if soft_cap is not None:
-                attn = soft_cap * torch.tanh(attn / soft_cap)
-            attn.masked_fill_(mask[None], float("-inf"))
-            attn = torch.softmax(attn, dim=-1).to(v.dtype)
-            out = torch.einsum("hqk,khd->qhd", attn, v)
+            if causal:
+                empty_mask = torch.ones(query_len, kv_len)
+                mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
+                if sliding_window is not None:
+                    sliding_window_mask = torch.triu(empty_mask,
+                                                    diagonal=kv_len -
+                                                            (query_len + sliding_window) +
+                                                            1).bool().logical_not()
+                    mask |= sliding_window_mask
+                if soft_cap is not None:
+                    attn = soft_cap * torch.tanh(attn / soft_cap)
+                attn.masked_fill_(mask[None], float("-inf"))
+            attn = torch.softmax(attn, dim=-1)
+            if suffix_attn is not None:
+                nq = min(suffix_attn.size(-1), query_len)
+                offset = query_len - nq
+                curr_suffix_attn = suffix_attn[kv_start_idx:kv_start_idx+kv_len,:,-nq:]
+                curr_suffix_ref = attn.transpose(1, 2).transpose(0, 1)[...,offset:]
+                # TODO somehow masked block is placed before non-masked
+                import pdb;pdb.set_trace()
+                # assert torch.allclose(curr_suffix_attn, curr_suffix_ref,
+                #                       atol=1e-2, rtol=1e-2)
+            out = torch.einsum("hqk,khd->qhd", attn.to(v.dtype), v)
             outs.append(out)
+            kv_start_idx += kv_len
 
         outputs.append(torch.cat(outs, dim=1))
-
         start_idx += query_len
 
     return torch.cat(outputs, dim=0)
@@ -292,7 +385,7 @@ def test_flash_attn_with_paged_kv(
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("soft_cap", [None])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("kvc", [False])
+@pytest.mark.parametrize("kvc", [True])
 @torch.inference_mode()
 def test_varlen_with_paged_kv(
         seq_lens: List[Tuple[int, int]],
@@ -376,7 +469,9 @@ def test_varlen_with_paged_kv(
         key_attn_agg_window=8,
     )
 
-    suffix_attn = convert_kvc_S_to_attn(
+    convert_fn = convert_kvc_S_to_attn_kvc if kvc else convert_kvc_S_to_attn
+
+    suffix_attn = convert_fn(
         kvc_S,
         sm_lse,
         8,  # key_attn_agg_window
