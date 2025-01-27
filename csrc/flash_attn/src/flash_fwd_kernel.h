@@ -720,7 +720,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.v_ptr) + row_offset_v),
                             Shape<Int<kBlockN>, Int<kHeadDim>>{},
                             make_stride(params.v_row_stride, _1{}));
-    const int head_index_A = (params.is_kvc_cache) ? bidh / params.h_h_k_ratio : bidh;
+    const int head_index_A = (params.is_kvc_cache) ? bidh % params.h_h_k_ratio : bidh;
     const int offset_A_k = binfo.k_offset(params.a_batch_stride, params.a_row_stride, bidb);
     const int offset_A_head = head_index_A * params.a_q_dim;
     const int offset_A_n = n_block * n_block_stride_A;
