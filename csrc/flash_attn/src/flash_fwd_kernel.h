@@ -862,8 +862,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // }
     tSgA.data() = tSgA.data() + key_agg_mblock_offset;
 
-    if (tidx == 0 && bidh == 0) {
-        printf("key_agg_mblock_offset=%d bidb=%d bidh=%d len=%d", key_agg_mblock_offset, bidb, bidh, binfo.actual_seqlen_k);
+    if (tidx == 0) {
+        printf("\nkey_agg_mblock_offset=%d bidb=%d bidh=%d kv_len=%d q_len=%d min_q_agg=%d max_q_agg=%d min_m_block=%d max_m_block=%d mblock=%d\n", key_agg_mblock_offset, bidb, bidh, binfo.actual_seqlen_k, binfo.actual_seqlen_q,
+        min_q_agg, max_q_agg, min_key_agg_mblock, max_key_agg_mblock, m_block);
     }
 
     // Prologue
